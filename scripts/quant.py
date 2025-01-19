@@ -88,3 +88,45 @@ def quantization(A, B, BLOCK_SZE, GROUP_SZE):
     
 
     return A_float8, scale_a, B_float8, scale_b
+
+
+@triton.jit
+def block_dequantization(c_ptr, 
+                   M,N,
+                   scale_ab_ptr,
+                   cm_stride,
+                   BLOCK_SZE:tl.constexpr):
+    
+
+    pid = tl.program_id(0)
+
+    n_pid_n = tl.cdiv(N, BLOCK_SZE)
+    pid_m = pid // n_pid_n
+    pid_n = pid % n_pid_n
+
+    scale = tl.load(scale_ab_ptr + pid)
+
+
+    start_m = pid_m*BLOCK_SZE
+    start_n = pid_n*BLOCK_SZE
+
+    off_m = (start_m + tl.arange(0, BLOCK_SZE)) 
+    off_n = (start_n + tl.arange(0, BLOCK_SZE))
+    mask = (off_m < M) & (off_n < N)
+
+    c_ptrs = c_ptr + off_m[:,None]* cm_stride + off_n[None, :]
+    c = tl.load(c_ptrs, mask, other= 0.0)
+    c *= scale
+
+    tl.store(c_ptrs, c, mask)
+
+
+def dequantization(C, scale, BLOCK_SZE):
+
+    M,N = C.shape
+    block_dequantization[((triton.cdiv(M, BLOCK_SZE) * triton.cdiv(N, BLOCK_SZE)), )](C, M, N, scale, C.stride(0), BLOCK_SZE)
+
+    return C
+
+    
+

@@ -1,5 +1,5 @@
 import torch
-from quant import quantization
+from quant import quantization, dequantization
 from gemm import tma_mm
 
 
@@ -10,6 +10,10 @@ def grid_quant(A, B, C):
     A_float8, scale_a, B_float8, scale_b = quantization(A, B, BLOCK_SZE, GROUP_SZE)
     C = tma_mm(A_float8, B_float8, C)
 
+    scale_ab = scale_a*scale_b
+
+    C = dequantization(C, scale_ab, BLOCK_SZE)
+
     return C
 
 
@@ -19,6 +23,7 @@ if __name__ == '__main__':
     
     dtype = torch.bfloat16
     device = torch.device('cuda')
+    
     A = torch.randn((M,K), dtype=dtype, device=device)
     B = torch.randn((N,K), dtype=dtype, device=device)
     C = torch.empty((M,N), dtype=dtype, device=device)
