@@ -1,8 +1,8 @@
 import torch
 import triton
 import triton.language as tl
-from triton.runtime import driver
 import numpy as np
+
 
 @triton.jit
 def block_quantization(A, 
@@ -92,13 +92,12 @@ def quantization(A, B, BLOCK_SZE, GROUP_SZE):
 
 
 @triton.jit
-def block_dequantization(c_ptr, 
+def block_dequantization(c_ptr, out_c,
                    M,N,
                    scale_ab_ptr,
                    cm_stride,
                    BLOCK_SZE:tl.constexpr):
     
-
     pid = tl.program_id(0)
 
     n_pid_n = tl.cdiv(N, BLOCK_SZE)
@@ -113,77 +112,60 @@ def block_dequantization(c_ptr,
 
     off_m = (start_m + tl.arange(0, BLOCK_SZE)) 
     off_n = (start_n + tl.arange(0, BLOCK_SZE))
-    mask = (off_m < M) & (off_n < N)
+    mask = ((off_m < M)[:, None]) & ((off_n < N)[None, :])
 
     c_ptrs = c_ptr + off_m[:,None]* cm_stride + off_n[None, :]
     c = tl.load(c_ptrs, mask, other= 0.0)
-    c *= scale
 
-    tl.store(c_ptrs, c, mask)
+    c_out = c*scale
+    out_c_ptrs =out_c + off_m[:,None]* cm_stride + off_n[None, :]
+    tl.store(out_c_ptrs, c_out, mask)
 
 
 def dequantization(C, scale, BLOCK_SZE):
-
+    new_C = torch.empty_like(C)
     M,N = C.shape
-    block_dequantization[((triton.cdiv(M, BLOCK_SZE) * triton.cdiv(N, BLOCK_SZE)), )](C, M, N, scale, C.stride(0), BLOCK_SZE)
+    block_dequantization[((triton.cdiv(M, BLOCK_SZE) * triton.cdiv(N, BLOCK_SZE)), )](C, new_C, M, N, scale, C.stride(0), BLOCK_SZE)
 
-    return C
-
+    return new_C
 
 
 @triton.jit
-def persistent(a_desc, b_desc, c_desc,
-               M, N, K,
-               NUM_SM: tl.constexpr,             
-               Br: tl.constexpr, Bc: tl.constexpr,Bk: tl.constexpr,
-               GROUP_SZE: tl.constexpr):
+def grouping(a_desc, b_desc, c_desc,
+                am_stride, ak_stride,
+                bk_stride, bn_stride,
+                cm_stride, cn_stride,
+                M, N, K,
+                Br:tl.constexpr, Bc:tl.constexpr, Bk:tl.constexpr,
+                GROUP_SZE_M:tl.constexpr,
+                ):
+    
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(M, Br)
+    num_pid_n = tl.cdiv(N, Bc)
+    num_pid_in_group = GROUP_SZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SZE_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    off_am = (pid_m * Br) 
+    off_bn = (pid_n * Bc)
+
     
 
-
-    tile_id = tl.program_id(0)
-    M_BLOCKS = tl.cdiv(M, Br)
-    N_BLOCKS = tl.cdiv(N, Bc)
-    K_BLOCKS = tl.cdiv(K, Bk)
-    ki = -1
-    pid_per_group = N_BLOCKS*GROUP_SZE
-
-    TOTAL_TILES = M_BLOCKS * N_BLOCKS
-    TILES_PER_SM = tl.cdiv(TOTAL_TILES,NUM_SM)
-    accumulator = tl.zeros([Br, Bc], dtype = tl.float32)
-
-    pid_m, pid_n = 0, 0
-    off_am = 0
-    off_bn = 0
-
-    for i in range(K_BLOCKS * TILES_PER_SM):
-        ki = tl.where(ki == K_BLOCKS-1, 0, ki+1)
-        
-        if ki == 0:
-            group_id = tile_id//pid_per_group
-            start_m = group_id*GROUP_SZE
-
-            group_size = min(GROUP_SZE, M_BLOCKS-start_m)
-
-            pid_m = start_m + (tile_id%pid_per_group)%group_size
-            pid_n = (tile_id%pid_per_group)//group_size
-            tile_id += NUM_SM
-        
-            off_am = pid_m*Br
-            off_bn = pid_n*Bc
-
-        off_k = ki*Bk
-        
+    accumulator = tl.zeros((Br, Bc), dtype=tl.float32)
+    for k in range(0, tl.cdiv(K, Bk)):
+        off_k = k*Bk
         a = tl._experimental_descriptor_load(a_desc, [off_am, off_k], [Br, Bk], dtype=tl.float8e4nv)
         b = tl._experimental_descriptor_load(b_desc, [off_bn, off_k], [Bc, Bk], dtype=tl.float8e4nv)
 
         accumulator = tl.dot(a, b.T, accumulator)
+        
 
-        if ki == K_BLOCKS-1:
-            c = accumulator.to(tl.bfloat16)
-
-            tl._experimental_descriptor_store(c_desc, c, [off_am, off_bn])
-
-            accumulator = tl.zeros([Br, Bc], dtype = tl.float32)
+    c = accumulator.to(tl.bfloat16)
+    tl._experimental_descriptor_store(c_desc, c, [off_am, off_bn])
 
 
 def tma_mm(A,B,C):
@@ -192,14 +174,13 @@ def tma_mm(A,B,C):
     K, N = B.shape
 
     DEVICE = torch.device('cuda:0')
-    properties = driver.active.utils.get_device_properties(DEVICE.index)
-    NUM_SM = properties["multiprocessor_count"]
+    
     
     Br = 64
     Bc = 64
     Bk = 256
     GROUP_SZE = 8
-    TMA_SIZE = 256
+    TMA_SIZE = 512
     num_warps = 4
     num_stages = 4
 
@@ -225,10 +206,10 @@ def tma_mm(A,B,C):
     desc_a = torch.tensor(desc_a, device='cuda')
     desc_b = torch.tensor(desc_b, device='cuda')
     desc_c = torch.tensor(desc_c, device='cuda')
-    
 
-    persistent[(min(NUM_SM, triton.cdiv(M,Br) * triton.cdiv(N, Bc)), )](desc_a, desc_b, desc_c,
-                                                                        NUM_SM, 
+
+
+    grouping[(triton.cdiv(M,Br) * triton.cdiv(N, Bc), )](desc_a, desc_b, desc_c, A.stride(0),A.stride(1), B.stride(0), B.stride(1), C.stride(0), C.stride(1),
                                                                         M, N, K, 
                                                                         Br, Bc, Bk,
                                                                         GROUP_SZE, num_warps = num_warps,
@@ -239,8 +220,8 @@ def tma_mm(A,B,C):
 
 
 def grid_quant(A, B, C):
-    BLOCK_SZE = 256
-    GROUP_SZE = 32
+    BLOCK_SZE = 16
+    GROUP_SZE = 4
 
     A_float8, scale_a, B_float8, scale_b = quantization(A, B, BLOCK_SZE, GROUP_SZE)
     C = tma_mm(A_float8, B_float8, C)
@@ -252,16 +233,14 @@ def grid_quant(A, B, C):
     return C
 
 
-
 if __name__ == '__main__':
-    M, K, N = 4096, 4096, 4096
+    M, K, N = 128, 4096,4096
     
     dtype = torch.bfloat16
     device = torch.device('cuda')
-    
+        
     A = torch.randn((M,K), dtype=dtype, device=device)
-    B = torch.randn((N,K), dtype=dtype, device=device)
+    B = torch.randn((K,N), dtype=dtype, device=device)
     C = torch.empty((M,N), dtype=dtype, device=device)
-    
+    B = B.T.contiguous()
     c = grid_quant(A,B,C)
-    
