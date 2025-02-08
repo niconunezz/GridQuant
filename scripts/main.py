@@ -183,6 +183,7 @@ def tma_mm(A,B,C):
     TMA_SIZE = 512
     num_warps = 4
     num_stages = 4
+    num_consumer_groups = 2
 
     desc_a = np.empty(TMA_SIZE, dtype=np.int8)
     desc_b = np.empty(TMA_SIZE, dtype=np.int8)
@@ -213,7 +214,8 @@ def tma_mm(A,B,C):
                                                                         M, N, K, 
                                                                         Br, Bc, Bk,
                                                                         GROUP_SZE, num_warps = num_warps,
-                                                                        num_stages = num_stages)
+                                                                        num_stages = num_stages,
+                                                                        num_consumer_groups = num_consumer_groups)
     
     return C
 
